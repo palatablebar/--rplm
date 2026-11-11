@@ -74,6 +74,7 @@ def get_analysis(
         "target_column": analysis.target_column,
         "severity": analysis.severity,
         "affected_count": analysis.affected_count,
+        "state_hash": analysis.state_hash,
         "report_json": analysis.report_json,
         "created_at": analysis.created_at.isoformat(),
         "cached": False,

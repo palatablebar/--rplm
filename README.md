@@ -31,7 +31,7 @@ docker compose ps
 docker compose exec backend python -m scripts.seed_demo
 ```
 
-该命令**可重复执行**：资产按 `(database_name, schema_name, name)`、转换按 `name`、边按 `(transformation_id, source_column, target_column)` 去重；重复执行不新增资产/边、不重算已 `parsed` 的 SQL、不改写历史 `ImpactAnalysis`。
+该命令**可重复执行**：资产按 `(database_name, schema_name, name)`、转换按 `name`、边按 `(transformation_id, source_column, target_column)` 去重；重复执行不新增资产/边、不重算已 `parsed` 的 SQL、不改写历史 `ImpactAnalysis`（历史分析按同参数 + 同状态指纹复用，血缘/列清单变化后会重算并保留旧报告）。
 
 执行后应得到：
 
@@ -69,7 +69,7 @@ docker compose exec backend python -m scripts.seed_demo
 - **资产与列清单**：`/assets` 按 `database.schema` 分组折叠、按类型筛选、按名称/列名搜索；`/assets/:id` 展示列清单（类型/可空/描述/上下游数）、一跳血缘图、结构变更时间线，并支持"登记变更"补列后重解析。
 - **SQL 转换与解析**：`/transformations` 左侧 SQL 编辑（行号 + 出错行高亮），右侧解析面板显示输入/输出资产、列映射表、`parse_status`、`parse_error` 原文（含 sqlglot 的 `line`/`col`）、`partial` 未展开列与可操作建议。
 - **列级血缘图**：`/lineage` 选起点资产、方向（upstream/downstream/both）、深度 1–4、粒度（资产级/列级）；节点按 `AssetType` 分形状，边按 `EdgeKind`（`aggregate` 粗线、`derived` 虚线、`join_key` 点线）与 `ParseStatus`（partial 半透明）分线型，环边橙红虚线。
-- **影响分析与迁移清单**：`/impact` 选资产 +（可选）列 + 变更类型发起分析，报告分区（严重度汇总条 / 受影响资产与列 / 传播路径 / 环截断说明 / 迁移清单），清单可勾选并复制建议 SQL，历史报告可回看。
+- **影响分析与迁移清单**：`/impact` 选资产 +（可选）列 + 变更类型发起分析，报告分区（严重度汇总条 / 受影响资产与列 / 传播路径 / 覆盖缺口 / 环截断说明 / 迁移清单），清单可勾选并复制建议 SQL，历史报告可回看。分析按"血缘 + 列清单"状态指纹判重：上游字段或列清单变化后自动重算，状态未变时重复发起复用同口径快照；列清单不完整导致的追踪缺口会在报告中显式标明，清单带"非完整清单"标识。
 - **结构变更时间线**：编辑列清单时自动生成 `SchemaChangeEvent`（`source=manual`）。
 - **审计日志**：写请求统一落 `audit_logs`（SQL 只存 `sha256` 与长度，不落原文）。
 - **解析配额与限流**：SQL 字节数、单用户并发解析数、8s 解析超时；超限返回 429 + `E_PARSE_QUOTA` / 504 + `E_PARSE_TIMEOUT`。
@@ -109,14 +109,14 @@ gb-546/
 │   │   ├── schemas/            # pydantic v2（common/user/data_asset/transformation/lineage/impact/quota/audit）
 │   │   ├── routes/             # auth / assets / transformations / lineage / impact / quota / audit / health
 │   │   ├── controllers/        # 只做装配与响应包装（按实体分文件）
-│   │   ├── services/           # asset / transformation / parse / lineage / impact / cycle / quota / audit /
-│   │   │                       # permission / schema_change
+│   │   ├── services/           # asset / transformation / parse / lineage / impact / impact_state（状态指纹与覆盖缺口）/
+│   │   │                       # cycle / quota / audit / permission / schema_change
 │   │   ├── middlewares/        # auth / rbac / audit_logger / parse_guard / error_handler
 │   │   ├── parsers/            # context / scope / projection / star / graph / engine（列级解析引擎）
 │   │   ├── utils/              # jwt / password / logger / formatters / pagination / hashing / errors
 │   │   ├── constants/          # asset / lineage / parse / impact / change / edge / roles / error_codes /
 │   │   │                       # log_templates（38 条模板）/ messages / limits
-│   │   ├── alembic/            # env.py + versions/0001_initial.py
+│   │   ├── alembic/            # env.py + versions/0001_initial.py、0002_impact_state_hash.py
 │   │   └── scripts/            # seed_demo.py（幂等）/ wait_for_db.py
 │   └── scripts/                # 容器内可执行：python -m scripts.seed_demo
 ├── worker/                     # 独立容器（复用 backend 镜像，PYTHONPATH=/app/backend:/app）
@@ -213,7 +213,8 @@ gb-546/
 - **`affected_count`** = 去重后的 `(asset_id, column)` 对数；`cte_result` 类资产**计入** `affected_count`，但**不进迁移清单**。
 - **报表数** = 受影响资产中排除 `cte_result` 的资产数（演示数据为 2）。
 - **环处理**：Tarjan 求强连通分量识别环；有环不影响保存，写入 `report_json.cycles`（`nodes` + `sample_path`），环边在图中虚线标记；命中环时报告严重度升为 `critical`。
-- **缓存**：同 `(target_asset_id, target_column, change_type)` 重复发起直接命中历史快照（`cached: true`），不重算；`force=true` 可强制重算。
+- **判重与重算（状态指纹）**：每次发起先计算 `state_hash`——当前**血缘边 + 转换解析状态/SQL 版本 + 资产列清单**的 sha256 指纹。判重口径为 `(target_asset_id, target_column, change_type, state_hash)`：同口径重复发起（含 `force=true`）直接复用最新同口径报告（`cached: true`），**不新增行**；上游字段变化、补列、重解析使指纹改变时自动重算并落一条新报告，**旧报告永不改写、保留供追溯**（历史行 `state_hash` 为 NULL，不参与命中）。
+- **覆盖缺口 `report_json.coverage`**：凡 `partial` / `failed` / `pending` 转换或 `SELECT *` 因列清单缺列无法展开，导致血缘无法继续追踪的，逐条记录缺口（`transformation_name`、`asset_name`、`missing_columns`、`uncertain_assets`），并汇总 `uncertain_scope`（可能受影响但无法确认的资产）。缺口位于本次传播可达边界上的标 `in_scope: true`。只要存在缺口，`checklist_complete=false` 且 `summary.checklist_complete=false`——此时 `migration_checklist` **不是完整迁移清单**，前端会显示"非完整清单"徽标与缺口表。
 
 **迁移清单 `action` 四种取值**
 

@@ -8,6 +8,7 @@ import { ImpactTable } from '../components/common/ImpactTable';
 import { SeverityMeter } from '../components/common/SeverityMeter';
 import { AppShell } from '../components/layout/AppShell';
 import { CHANGE_TYPES, CHANGE_TYPE_LABELS, type ChangeType } from '../constants/changeType';
+import { GAP_KIND_LABELS } from '../constants/gapKind';
 import { MSG_NO_DOWNSTREAM, MSG_VIEWER_FORBIDDEN } from '../constants/messages';
 import { useAuthStore } from '../stores/authStore';
 import type { DataAsset } from '../types/dataAsset';
@@ -75,6 +76,8 @@ export function ImpactPage() {
 
   const report = analysis?.report_json;
   const checklist = report?.migration_checklist || [];
+  const coverage = report?.coverage;
+  const checklistComplete = coverage ? coverage.checklist_complete : true;
   const selectedChecklist = useMemo(
     () => checklist.filter((_item, index) => checked[index]),
     [checklist, checked],
@@ -175,10 +178,20 @@ export function ImpactPage() {
               <span className="value">{report.summary.min_depth ?? '—'}</span>
               <span className="label">最小传播深度</span>
             </div>
+            <div className="metric">
+              <span className="value">
+                {checklistComplete ? (
+                  <span className="badge">清单完整</span>
+                ) : (
+                  <span className="badge brass">有缺口 · 非完整清单</span>
+                )}
+              </span>
+              <span className="label">迁移清单覆盖度</span>
+            </div>
             {analysis.cached && (
               <div className="metric">
-                <span className="badge brass">缓存命中</span>
-                <span className="label">同参数历史快照</span>
+                <span className="badge brass">同口径快照</span>
+                <span className="label">输入未变，复用历史报告</span>
               </div>
             )}
           </div>
@@ -230,12 +243,67 @@ export function ImpactPage() {
 
           <hr className="section-rule" />
           <section className="report-section">
+            <div className="eyebrow">04 · 覆盖缺口（血缘无法追踪的边界）</div>
+            {!coverage || coverage.total_gap_count === 0 ? (
+              <div className="notice small" style={{ marginTop: 10 }}>
+                全部相关转换解析成功且列清单完整，迁移清单覆盖当前血缘可达的全部下游。
+              </div>
+            ) : (
+              <>
+                <div className="notice warn small" style={{ marginTop: 10 }}>
+                  {coverage.disclaimer}
+                </div>
+                {coverage.uncertain_scope.length > 0 && (
+                  <div className="small muted" style={{ marginTop: 6 }}>
+                    不确定范围（可能受影响但无法确认的资产）：{coverage.uncertain_scope.join('、')}
+                  </div>
+                )}
+                <table className="data-table dark" style={{ marginTop: 10 }}>
+                  <thead>
+                    <tr>
+                      <th>缺口类型</th>
+                      <th>转换</th>
+                      <th>涉及资产</th>
+                      <th>缺失列</th>
+                      <th>影响本次分析</th>
+                      <th>说明</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...coverage.in_scope, ...coverage.other_gaps].map((gap) => (
+                      <tr key={gap.gap_id}>
+                        <td className="small">{GAP_KIND_LABELS[gap.kind] || gap.kind}</td>
+                        <td className="mono small">{gap.transformation_name}</td>
+                        <td className="mono small">{gap.asset_name || '—'}</td>
+                        <td className="mono small">
+                          {gap.missing_columns.length > 0 ? gap.missing_columns.join(', ') : '—'}
+                        </td>
+                        <td className="small">{gap.in_scope ? '是' : '否（全局）'}</td>
+                        <td className="small muted">{gap.detail}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
+            )}
+          </section>
+
+          <hr className="section-rule" />
+          <section className="report-section">
             <div className="spread">
-              <div className="eyebrow">04 · 迁移清单（{checklist.length} 条）</div>
+              <div className="eyebrow">
+                05 · 迁移清单（{checklist.length} 条）
+                {!checklistComplete && <span className="badge brass" style={{ marginLeft: 8 }}>非完整清单</span>}
+              </div>
               <button type="button" className="btn" onClick={copySelected}>
                 复制勾选的建议 SQL
               </button>
             </div>
+            {!checklistComplete && (
+              <div className="notice warn small" style={{ marginTop: 8 }}>
+                存在覆盖缺口：以下清单只包含可追踪的下游，缺口中的资产需人工确认，不能当作完整迁移清单使用。
+              </div>
+            )}
             {copied && <div className="notice small" style={{ marginTop: 8 }}>{copied}</div>}
             {report.excluded_from_checklist.length > 0 && (
               <div className="small muted" style={{ marginTop: 8 }}>
@@ -267,7 +335,7 @@ export function ImpactPage() {
 
           <hr className="section-rule" />
           <section className="report-section">
-            <div className="eyebrow">05 · 报告导出</div>
+            <div className="eyebrow">06 · 报告导出</div>
             <div className="row" style={{ marginTop: 8 }}>
               <button
                 type="button"
@@ -284,7 +352,10 @@ export function ImpactPage() {
               >
                 导出 report_json.migration_checklist
               </button>
-              <span className="small muted">报告 id {analysis.id.slice(0, 8)}</span>
+              <span className="small muted">
+                报告 id {analysis.id.slice(0, 8)}
+                {report.state_hash && ` · 状态指纹 ${report.state_hash.slice(0, 12)}`}
+              </span>
             </div>
           </section>
         </div>
@@ -302,6 +373,7 @@ export function ImpactPage() {
               <th>变更类型</th>
               <th>严重度</th>
               <th>受影响列</th>
+              <th>清单完整性</th>
             </tr>
           </thead>
           <tbody>
@@ -322,6 +394,13 @@ export function ImpactPage() {
                   <span className={`sev ${item.severity}`}>{item.severity}</span>
                 </td>
                 <td className="mono">{item.affected_count}</td>
+                <td className="small">
+                  {item.summary?.checklist_complete === undefined
+                    ? '—'
+                    : item.summary.checklist_complete
+                      ? '完整'
+                      : '有缺口'}
+                </td>
               </tr>
             ))}
           </tbody>

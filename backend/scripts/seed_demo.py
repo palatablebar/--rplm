@@ -5,7 +5,7 @@
 - 转换 name
 - 血缘边 (transformation_id, source_column, target_column)（由 parse_service 先删后插保证）
 - 历史结构变更事件 (asset_id, column_name, change_type, old_type, new_type)
-- 历史影响分析（同参数已存在则不重算、不改写）
+- 历史影响分析（同参数 + 同状态指纹才复用；血缘/列清单变化后重算，旧报告保留不改写）
 
 血缘边全部由 app/services/parse_service.py 真实解析生成，脚本内不手写任何边。
 """
@@ -347,13 +347,23 @@ def _ensure_schema_change(db, assets) -> None:
 
 
 def _ensure_historical_impact(db, users, assets) -> ImpactAnalysis | None:
+    """历史影响分析：同参数 + 同输入指纹才复用；血缘/列清单变化后重算，旧报告保留。"""
+    from app.services.impact_state import build_impact_state
+
     asset = assets["dwd.order_detail"]
+    state_hash = build_impact_state(
+        db,
+        target_asset_id=asset.id,
+        target_column="pay_amount",
+        change_type=ChangeType.change_type.value,
+    )["state_hash"]
     existing = (
         db.query(ImpactAnalysis)
         .filter(
             ImpactAnalysis.target_asset_id == asset.id,
             ImpactAnalysis.target_column == "pay_amount",
             ImpactAnalysis.change_type == ChangeType.change_type.value,
+            ImpactAnalysis.state_hash == state_hash,
         )
         .order_by(ImpactAnalysis.created_at.desc())
         .first()

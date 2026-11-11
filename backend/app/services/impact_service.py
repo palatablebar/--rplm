@@ -15,10 +15,9 @@ from app.constants.impact import SEVERITY_ORDER, ImpactSeverity
 from app.constants.lineage import MAX_IMPACT_DEPTH
 from app.models.data_asset import DataAsset
 from app.models.impact_analysis import ImpactAnalysis
-from app.models.lineage_edge import LineageEdge
-from app.models.transformation import Transformation
 from app.models.user import User
 from app.parsers.graph import build_adjacency, find_cycles, reachable
+from app.services.impact_state import build_impact_state, collect_coverage_gaps
 from app.utils.errors import AppError
 from app.utils.logger import log
 
@@ -133,11 +132,54 @@ def analyze(
     change_type: str,
     force: bool = False,
 ) -> tuple[ImpactAnalysis, bool]:
+    """发起一次影响分析，返回 (报告, 是否复用同口径快照)。
+
+    判重口径 = (target_asset_id, target_column, change_type, state_hash)：
+    - state_hash 是当前血缘边 + 转换解析状态 + 资产列清单的指纹，上游字段变化、
+      补列、重解析后指纹必然改变，自动重算并落一条新报告，旧报告保留供追溯；
+    - 状态未变时重复执行（含 force=true）直接复用最新同口径报告，不新增行。
+      force 保留仅为 API 兼容，不再绕过判重。
+    """
     asset = db.get(DataAsset, target_asset_id)
     if asset is None:
         raise AppError(E_NOT_FOUND, "目标资产不存在", entity="data_asset", field="target_asset_id")
 
+    # 先算当前输入指纹：血缘边 + 转换解析状态 + 资产列清单。
+    # 上游字段变化、补列、重解析都会改变指纹，从而触发重算；同指纹重复执行复用同口径报告。
+    state = build_impact_state(
+        db,
+        target_asset_id=target_asset_id,
+        target_column=target_column,
+        change_type=change_type,
+    )
+    state_hash = state["state_hash"]
+
     cached = (
+        db.query(ImpactAnalysis)
+        .filter(
+            ImpactAnalysis.target_asset_id == target_asset_id,
+            ImpactAnalysis.target_column == target_column,
+            ImpactAnalysis.change_type == change_type,
+            ImpactAnalysis.state_hash == state_hash,
+        )
+        .order_by(ImpactAnalysis.created_at.desc())
+        .first()
+    )
+    if cached is not None:
+        # force 也不允许绕过同口径判重：输入未变时重算结果必然相同，重复执行不新增报告。
+        log(
+            logger,
+            "IMPACT_CACHE_HIT",
+            level=logging.INFO,
+            analysis=str(cached.id),
+            asset=asset.display_name,
+            column=target_column,
+            state_hash=state_hash[:12],
+        )
+        return cached, True
+
+    # 同目标存在旧指纹报告：说明血缘/列清单已变化，本次必须重算；旧报告保留不删不改。
+    stale = (
         db.query(ImpactAnalysis)
         .filter(
             ImpactAnalysis.target_asset_id == target_asset_id,
@@ -147,16 +189,17 @@ def analyze(
         .order_by(ImpactAnalysis.created_at.desc())
         .first()
     )
-    if cached is not None and not force:
+    if stale is not None:
         log(
             logger,
-            "IMPACT_CACHE_HIT",
+            "IMPACT_STATE_CHANGED",
             level=logging.INFO,
-            analysis=str(cached.id),
             asset=asset.display_name,
-            column=target_column,
+            column=target_column or "(all)",
+            previous_analysis=str(stale.id),
+            previous_state_hash=(stale.state_hash or "")[:12] or None,
+            state_hash=state_hash[:12],
         )
-        return cached, True
 
     log(
         logger,
@@ -165,11 +208,12 @@ def analyze(
         asset=asset.display_name,
         column=target_column or "(all)",
         change_type=change_type,
+        state_hash=state_hash[:12],
     )
 
-    assets = {str(a.id): a for a in db.query(DataAsset).all()}
-    transformations = {str(t.id): t for t in db.query(Transformation).all()}
-    edges = db.query(LineageEdge).all()
+    assets = {str(a.id): a for a in state["assets"]}
+    transformations = {str(t.id): t for t in state["transformations"]}
+    edges = state["edges"]
     edge_payload = [
         {
             "source_asset_id": str(edge.source_asset_id),
@@ -330,6 +374,26 @@ def analyze(
         and assets[node["asset_id"]].asset_type == AssetType.cte_result.value
     }
 
+    # 覆盖缺口：列清单不完整 / 解析失败导致血缘无法继续追踪的边界。
+    # 可达集合 = 起点 + 本次 BFS 命中的全部 (asset, column)。
+    reachable_asset_ids = {str(target_asset_id)} | {asset_key for (asset_key, _col) in depths.keys()}
+    coverage = collect_coverage_gaps(
+        transformations=list(transformations.values()),
+        assets_by_id=assets,
+        reachable_asset_ids=reachable_asset_ids,
+    )
+    if coverage["in_scope_gap_count"] > 0:
+        log(
+            logger,
+            "IMPACT_COVERAGE_GAP",
+            level=logging.WARNING,
+            asset=asset.display_name,
+            column=target_column or "(all)",
+            in_scope=coverage["in_scope_gap_count"],
+            total=coverage["total_gap_count"],
+            reasons=",".join(coverage["gap_reasons"]),
+        )
+
     report = {
         "target": {
             "asset_id": str(target_asset_id),
@@ -337,6 +401,7 @@ def analyze(
             "column": target_column,
             "change_type": change_type,
         },
+        "state_hash": state_hash,
         "summary": {
             "severity": severity.value,
             "severity_label": {
@@ -352,12 +417,15 @@ def analyze(
             "max_depth": max_depth,
             "truncated": truncated,
             "depth_limit": MAX_IMPACT_DEPTH,
+            "checklist_complete": coverage["checklist_complete"],
+            "in_scope_gap_count": coverage["in_scope_gap_count"],
         },
         "nodes": affected,
         "paths": path_items,
         "cycles": display_cycles,
         "cycle_hit": hit_cycle,
         "migration_checklist": checklist,
+        "coverage": coverage,
         "truncated": truncated,
         "excluded_from_checklist": sorted(
             {
@@ -376,6 +444,7 @@ def analyze(
         target_column=target_column,
         severity=severity.value,
         affected_count=len(affected),
+        state_hash=state_hash,
         report_json=report,
     )
     db.add(analysis)
@@ -408,6 +477,7 @@ def history(db: Session, limit: int = 20) -> list[dict]:
             "target_column": row.target_column,
             "severity": row.severity,
             "affected_count": row.affected_count,
+            "state_hash": row.state_hash,
             "created_at": row.created_at.isoformat(),
             "summary": (row.report_json or {}).get("summary", {}),
         }

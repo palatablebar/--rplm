@@ -16,10 +16,17 @@ LINEAGE_JOIN_KEY = "LINEAGE_JOIN_KEY transformation={transformation} pair={pair}
 LINEAGE_AMBIGUOUS_COLUMN = "LINEAGE_AMBIGUOUS_COLUMN transformation={transformation} column={column} candidates={candidates}"
 
 CYCLE_DETECTED = "CYCLE_DETECTED components={components} sample={sample}"
-IMPACT_START = "IMPACT_START asset={asset} column={column} change_type={change_type}"
+IMPACT_START = "IMPACT_START asset={asset} column={column} change_type={change_type} state_hash={state_hash}"
 IMPACT_GRADED = "IMPACT_GRADED severity={severity} affected={affected} reports={reports} min_depth={depth}"
 IMPACT_TRUNCATED = "IMPACT_TRUNCATED depth_limit={limit} affected={affected}"
-IMPACT_CACHE_HIT = "IMPACT_CACHE_HIT analysis={analysis} asset={asset} column={column}"
+IMPACT_CACHE_HIT = "IMPACT_CACHE_HIT analysis={analysis} asset={asset} column={column} state_hash={state_hash}"
+IMPACT_STATE_CHANGED = (
+    "IMPACT_STATE_CHANGED asset={asset} column={column} previous_analysis={previous_analysis} "
+    "previous_state_hash={previous_state_hash} state_hash={state_hash}"
+)
+IMPACT_COVERAGE_GAP = (
+    "IMPACT_COVERAGE_GAP asset={asset} column={column} in_scope={in_scope} total={total} reasons={reasons}"
+)
 
 ASSET_CREATED = "ASSET_CREATED asset={asset} type={type}"
 ASSET_UPDATED = "ASSET_UPDATED asset={asset} columns={columns}"
